@@ -134,32 +134,30 @@ static vtpc_page_t* load_page(int vfd, off_t page_no) {
   }
 
   off_t off = page_no * (off_t)VTPC_PAGE_SIZE;
-  
-  // Инициализируем всю страницу нулями
-  memset(slot->data, 0, VTPC_PAGE_SIZE);
-  
-  // Пытаемся прочитать с диска, если это возможно
-  struct stat st;
-  if (fstat(osfd, &st) == 0) {
-    off_t file_size = st.st_size;
-    if (off < file_size) {
-      size_t to_read = VTPC_PAGE_SIZE;
-      if (off + to_read > file_size) {
-        to_read = (size_t)(file_size - off);
-      }
-      
-      ssize_t r = pread(osfd, slot->data, to_read, off);
-      if (r < 0) {
-        return NULL;
-      }
-    }
+
+  unsigned char tmp[VTPC_PAGE_SIZE];
+  ssize_t r = pread(osfd, tmp, VTPC_PAGE_SIZE, off);
+  if (r < 0) return NULL;
+
+  if (r < VTPC_PAGE_SIZE) {
+    memset(tmp + r, 0, (size_t)(VTPC_PAGE_SIZE - r));
   }
 
+  memcpy(slot->data, tmp, VTPC_PAGE_SIZE);
   slot->valid = 1;
   slot->dirty = 0;
   slot->owner = vfd;
   slot->page_no = page_no;
   return slot;
+}
+
+static off_t get_effective_file_size(int fd) {
+  // Получаем максимальный размер: либо логический (есть незаписанные данные),
+  // либо реальный размер на диске
+  struct stat st;
+  if (fstat(g_files[fd].os_fd, &st) != 0) return -1;
+  off_t disk_size = st.st_size;
+  return (g_files[fd].size > disk_size) ? g_files[fd].size : disk_size;
 }
 
 int vtpc_impl_open(const char* path, int mode, int access) {
@@ -230,15 +228,25 @@ ssize_t vtpc_impl_read(int fd, void* buf, size_t count) {
     return -1;
   }
 
+  off_t file_size = get_effective_file_size(fd);
+  if (file_size < 0) return -1;
+
   size_t done = 0;
   unsigned char* out = (unsigned char*)buf;
 
   while (done < count) {
     off_t pos = g_files[fd].pos;
+
+    // EOF по эффективному размеру файла
+    if (pos >= file_size) break;
+
     off_t page_no = pos / (off_t)VTPC_PAGE_SIZE;
     size_t in_page = (size_t)(pos % (off_t)VTPC_PAGE_SIZE);
     size_t to_copy = VTPC_PAGE_SIZE - in_page;
     if (to_copy > (count - done)) to_copy = count - done;
+
+    off_t remain = file_size - pos;
+    if ((off_t)to_copy > remain) to_copy = (size_t)remain;
 
     vtpc_page_t* p = load_page(fd, page_no);
     if (!p) return (done == 0) ? -1 : (ssize_t)done;
@@ -246,6 +254,8 @@ ssize_t vtpc_impl_read(int fd, void* buf, size_t count) {
     memcpy(out + done, p->data + in_page, to_copy);
     done += to_copy;
     g_files[fd].pos += (off_t)to_copy;
+
+    if (to_copy == 0) break;
   }
 
   return (ssize_t)done;

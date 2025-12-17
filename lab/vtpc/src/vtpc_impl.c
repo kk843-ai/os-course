@@ -27,14 +27,14 @@ typedef struct {
   int used;
   int os_fd;
   off_t pos;
-  off_t size;  // логический размер (учитывает данные в кэше)
+  off_t size;  // логический размер файла (с учётом данных в кэше)
 } vtpc_file_t;
 
 typedef struct {
   int valid;
   int dirty;
-  int owner;      // vtpc fd index
-  off_t page_no;  // offset / PAGE_SIZE
+  int owner;
+  off_t page_no;
   unsigned char data[VTPC_PAGE_SIZE];
 } vtpc_page_t;
 
@@ -185,17 +185,16 @@ int vtpc_impl_close(int fd) {
     return -1;
   }
 
-  // flush all cached pages for this fd
   for (int i = 0; i < VTPC_CACHE_PAGES; i++) {
     if (g_cache[i].valid && g_cache[i].owner == fd) {
       if (flush_page(&g_cache[i]) != 0) return -1;
     }
   }
 
-  // ensure file size visible to OS (important for tests)
+  // применяем логический размер к реальному файлу
   if (ftruncate(g_files[fd].os_fd, g_files[fd].size) != 0) return -1;
 
-  // drop pages after flush+truncate
+  // очищаем страницы fd
   for (int i = 0; i < VTPC_CACHE_PAGES; i++) {
     if (g_cache[i].valid && g_cache[i].owner == fd) {
       g_cache[i].valid = 0;
@@ -226,7 +225,7 @@ ssize_t vtpc_impl_read(int fd, void* buf, size_t count) {
   while (done < count) {
     off_t pos = g_files[fd].pos;
 
-    // EOF based on logical size (not fstat)
+    // EOF по логическому size
     if (pos >= g_files[fd].size) break;
 
     off_t page_no = pos / (off_t)VTPC_PAGE_SIZE;
@@ -279,7 +278,6 @@ ssize_t vtpc_impl_write(int fd, const void* buf, size_t count) {
     done += to_copy;
     g_files[fd].pos += (off_t)to_copy;
 
-    // update logical size
     if (g_files[fd].pos > g_files[fd].size) g_files[fd].size = g_files[fd].pos;
   }
 
@@ -291,7 +289,6 @@ off_t vtpc_impl_lseek(int fd, off_t offset, int whence) {
     errno = EBADF;
     return (off_t)-1;
   }
-
   if (whence != SEEK_SET) {
     errno = EINVAL;
     return (off_t)-1;
@@ -317,7 +314,7 @@ int vtpc_impl_fsync(int fd) {
     }
   }
 
-  // ensure size is applied before fsync (critical for tests)
+  // применяем размер до fsync
   if (ftruncate(g_files[fd].os_fd, g_files[fd].size) != 0) return -1;
 
   return fsync(g_files[fd].os_fd);

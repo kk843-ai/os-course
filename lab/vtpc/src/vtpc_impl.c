@@ -27,13 +27,14 @@ typedef struct {
   int used;
   int os_fd;
   off_t pos;
+  off_t size;  // логический размер (учитывает данные в кэше)
 } vtpc_file_t;
 
 typedef struct {
   int valid;
   int dirty;
-  int owner;
-  off_t page_no;
+  int owner;      // vtpc fd index
+  off_t page_no;  // offset / PAGE_SIZE
   unsigned char data[VTPC_PAGE_SIZE];
 } vtpc_page_t;
 
@@ -55,6 +56,7 @@ static int alloc_fd(void) {
       g_files[i].used = 1;
       g_files[i].os_fd = -1;
       g_files[i].pos = 0;
+      g_files[i].size = 0;
       return i;
     }
   }
@@ -67,6 +69,7 @@ static void free_fd(int vfd) {
   g_files[vfd].used = 0;
   g_files[vfd].os_fd = -1;
   g_files[vfd].pos = 0;
+  g_files[vfd].size = 0;
 }
 
 static vtpc_page_t* find_page(int vfd, off_t page_no) {
@@ -163,8 +166,16 @@ int vtpc_impl_open(const char* path, int mode, int access) {
     return -1;
   }
 
+  struct stat st;
+  if (fstat(osfd, &st) != 0) {
+    close(osfd);
+    free_fd(vfd);
+    return -1;
+  }
+
   g_files[vfd].os_fd = osfd;
   g_files[vfd].pos = 0;
+  g_files[vfd].size = st.st_size;
   return vfd;
 }
 
@@ -174,9 +185,19 @@ int vtpc_impl_close(int fd) {
     return -1;
   }
 
+  // flush all cached pages for this fd
   for (int i = 0; i < VTPC_CACHE_PAGES; i++) {
     if (g_cache[i].valid && g_cache[i].owner == fd) {
       if (flush_page(&g_cache[i]) != 0) return -1;
+    }
+  }
+
+  // ensure file size visible to OS (important for tests)
+  if (ftruncate(g_files[fd].os_fd, g_files[fd].size) != 0) return -1;
+
+  // drop pages after flush+truncate
+  for (int i = 0; i < VTPC_CACHE_PAGES; i++) {
+    if (g_cache[i].valid && g_cache[i].owner == fd) {
       g_cache[i].valid = 0;
       g_cache[i].dirty = 0;
       g_cache[i].owner = -1;
@@ -205,16 +226,15 @@ ssize_t vtpc_impl_read(int fd, void* buf, size_t count) {
   while (done < count) {
     off_t pos = g_files[fd].pos;
 
-    struct stat st;
-    if (fstat(g_files[fd].os_fd, &st) != 0) return (done == 0) ? -1 : (ssize_t)done;
-    if (pos >= st.st_size) break;
+    // EOF based on logical size (not fstat)
+    if (pos >= g_files[fd].size) break;
 
     off_t page_no = pos / (off_t)VTPC_PAGE_SIZE;
     size_t in_page = (size_t)(pos % (off_t)VTPC_PAGE_SIZE);
     size_t to_copy = VTPC_PAGE_SIZE - in_page;
     if (to_copy > (count - done)) to_copy = count - done;
 
-    off_t remain = st.st_size - pos;
+    off_t remain = g_files[fd].size - pos;
     if ((off_t)to_copy > remain) to_copy = (size_t)remain;
 
     vtpc_page_t* p = load_page(fd, page_no);
@@ -258,6 +278,9 @@ ssize_t vtpc_impl_write(int fd, const void* buf, size_t count) {
 
     done += to_copy;
     g_files[fd].pos += (off_t)to_copy;
+
+    // update logical size
+    if (g_files[fd].pos > g_files[fd].size) g_files[fd].size = g_files[fd].pos;
   }
 
   return (ssize_t)done;
@@ -293,6 +316,9 @@ int vtpc_impl_fsync(int fd) {
       if (flush_page(&g_cache[i]) != 0) return -1;
     }
   }
+
+  // ensure size is applied before fsync (critical for tests)
+  if (ftruncate(g_files[fd].os_fd, g_files[fd].size) != 0) return -1;
 
   return fsync(g_files[fd].os_fd);
 }

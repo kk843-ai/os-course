@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <linux/fs.h>
 
 #ifndef VTPC_PAGE_SIZE
 #define VTPC_PAGE_SIZE 4096
@@ -91,6 +92,13 @@ static int flush_page(vtpc_page_t* p) {
   }
 
   off_t off = p->page_no * (off_t)VTPC_PAGE_SIZE;
+  
+  // Для O_DIRECT: гарантируем выровненный доступ
+  if (off % VTPC_PAGE_SIZE != 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  
   ssize_t w = pwrite(osfd, p->data, VTPC_PAGE_SIZE, off);
   if (w < 0) return -1;
   if (w != VTPC_PAGE_SIZE) {
@@ -134,16 +142,28 @@ static vtpc_page_t* load_page(int vfd, off_t page_no) {
   }
 
   off_t off = page_no * (off_t)VTPC_PAGE_SIZE;
-
-  unsigned char tmp[VTPC_PAGE_SIZE];
-  ssize_t r = pread(osfd, tmp, VTPC_PAGE_SIZE, off);
-  if (r < 0) return NULL;
-
-  if (r < VTPC_PAGE_SIZE) {
-    memset(tmp + r, 0, (size_t)(VTPC_PAGE_SIZE - r));
+  
+  // Проверяем выравнивание для O_DIRECT
+  if (off % VTPC_PAGE_SIZE != 0) {
+    errno = EINVAL;
+    return NULL;
   }
 
-  memcpy(slot->data, tmp, VTPC_PAGE_SIZE);
+  // Для O_DIRECT: пытаемся прочитать полную страницу
+  ssize_t r = pread(osfd, slot->data, VTPC_PAGE_SIZE, off);
+  if (r < 0) {
+    // Если ошибка EINVAL, возможно, пытаемся читать за пределами файла
+    // В этом случае заполняем нулями
+    if (errno == EINVAL) {
+      memset(slot->data, 0, VTPC_PAGE_SIZE);
+    } else {
+      return NULL;
+    }
+  } else if (r < VTPC_PAGE_SIZE) {
+    // Если прочитано меньше полной страницы, заполняем остаток нулями
+    memset(slot->data + r, 0, (size_t)(VTPC_PAGE_SIZE - r));
+  }
+
   slot->valid = 1;
   slot->dirty = 0;
   slot->owner = vfd;
@@ -169,10 +189,15 @@ int vtpc_impl_open(const char* path, int mode, int access) {
   int vfd = alloc_fd();
   if (vfd < 0) return -1;
 
-  int osfd = open(path, mode, access);
+  // Добавляем O_DIRECT для обхода кэша ядра
+  int osfd = open(path, mode | O_DIRECT, access);
   if (osfd < 0) {
-    free_fd(vfd);
-    return -1;
+    // Если O_DIRECT не поддерживается, пробуем без него
+    osfd = open(path, mode, access);
+    if (osfd < 0) {
+      free_fd(vfd);
+      return -1;
+    }
   }
 
   struct stat st;

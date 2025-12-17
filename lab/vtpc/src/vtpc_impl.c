@@ -138,7 +138,7 @@ static vtpc_page_t* load_page(int vfd, off_t page_no) {
   // Инициализируем всю страницу нулями
   memset(slot->data, 0, VTPC_PAGE_SIZE);
   
-  // Пытаемся прочитать с диска, если это в пределах файла
+  // Пытаемся прочитать с диска, если это возможно
   struct stat st;
   if (fstat(osfd, &st) == 0) {
     off_t file_size = st.st_size;
@@ -149,8 +149,9 @@ static vtpc_page_t* load_page(int vfd, off_t page_no) {
       }
       
       ssize_t r = pread(osfd, slot->data, to_read, off);
-      if (r < 0) return NULL;
-      // Если прочитано меньше, чем to_read, остаток уже нули
+      if (r < 0) {
+        return NULL;
+      }
     }
   }
 
@@ -239,21 +240,12 @@ ssize_t vtpc_impl_read(int fd, void* buf, size_t count) {
     size_t to_copy = VTPC_PAGE_SIZE - in_page;
     if (to_copy > (count - done)) to_copy = count - done;
 
-    // Проверяем, не выходим ли за логический размер
-    off_t logical_end = g_files[fd].size;
-    off_t remain = logical_end - pos;
-    if (remain > 0 && (off_t)to_copy > remain) {
-      to_copy = (size_t)remain;
-    }
-
     vtpc_page_t* p = load_page(fd, page_no);
     if (!p) return (done == 0) ? -1 : (ssize_t)done;
 
     memcpy(out + done, p->data + in_page, to_copy);
     done += to_copy;
     g_files[fd].pos += (off_t)to_copy;
-
-    if (to_copy == 0) break;
   }
 
   return (ssize_t)done;
